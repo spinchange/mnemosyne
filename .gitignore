@@ -1,24 +1,46 @@
-# Binaries
+# --- Mnemosyne Workspace Ignores ---
+
+# Binaries & OS Artifacts
 mnemosyne.exe
 mnemosyne-linux
 mnemosyne-mac-arm64
 *.exe
 *.exe~
+*.dll
+*.so
+*.dylib
+bin/
 
-# Data (CRITICAL: Do not push personal archive)
+# Go specific
+.gocache/
+vendor/
+
+# --- CRITICAL: Private Journal Data ---
+# Do not remove these; they protect your personal archive.
 *.db
 *.db-wal
 *.db-shm
 snapshots/
+backups/
 .mnemosyne/
 
-# Debugging
-debug.log
-
-# IDEs
-.vscode/
-.idea/
-# Internal Design Docs
+# Internal Design & Working Docs
+# Hidden from GitHub to keep the repository focused on source code.
 CLAUDE_COMMAND.txt
 PHASE4_INSTRUCTIONS.md
 PHASE5_INSTRUCTIONS.md
+MNEMOSYNE_DEBRIEF.md
+audit.py
+
+# Logs & Debugging
+debug.log
+*.log
+
+# IDEs & Editor Configuration
+.vscode/
+.idea/
+.project
+.settings/
+*.swp
+*.swo
+*~
