@@ -18,3 +18,7 @@ debug.log
 # IDEs
 .vscode/
 .idea/
+# Internal Design Docs
+CLAUDE_COMMAND.txt
+PHASE4_INSTRUCTIONS.md
+PHASE5_INSTRUCTIONS.md
