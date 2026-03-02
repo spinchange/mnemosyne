@@ -1,0 +1,20 @@
+# Binaries
+mnemosyne.exe
+mnemosyne-linux
+mnemosyne-mac-arm64
+*.exe
+*.exe~
+
+# Data (CRITICAL: Do not push personal archive)
+*.db
+*.db-wal
+*.db-shm
+snapshots/
+.mnemosyne/
+
+# Debugging
+debug.log
+
+# IDEs
+.vscode/
+.idea/

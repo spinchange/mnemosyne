@@ -1,0 +1,3 @@
+# test log
+getenv GOTMPDIR
+open C:\Users\user\AppData\Local\Temp
