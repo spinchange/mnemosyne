@@ -1,6 +1,7 @@
 package store
 
 import (
+	"mnemosyne/internal/crypto"
 	"mnemosyne/internal/domain"
 	"path/filepath"
 	"testing"
@@ -113,5 +114,55 @@ func TestSearch(t *testing.T) {
 	if err != nil { t.Fatalf("Case-insensitive search failed: %v", err) }
 	if len(results) != 1 || results[0].ID != e1.ID {
 		t.Errorf("Case-insensitive search failed: expected e1, got %v", results)
+	}
+}
+
+func TestMigrationResilience(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "resilience.db")
+
+	s, _ := NewSQLiteStore(dbPath)
+	defer s.Close()
+	
+	// 1. Create some plaintext data
+	e1 := &domain.Entry{Title: "Title 1", Body: "Body 1"}
+	s.CreateEntry(e1)
+	
+	// 2. Setup encryption (this runs the migration)
+	password := []byte("pass123")
+	dataKey, err := s.SetupEncryption(password)
+	if err != nil {
+		t.Fatalf("SetupEncryption failed: %v", err)
+	}
+	defer crypto.Zero(dataKey)
+
+	// 3. Verify data is readable
+	retrieved, err := s.GetEntry(e1.ID)
+	if err != nil {
+		t.Fatalf("GetEntry failed after migration: %v", err)
+	}
+	if retrieved.Title != "Title 1" {
+		t.Errorf("Data corrupted after migration: got %q, want %q", retrieved.Title, "Title 1")
+	}
+
+	// 4. Simulate a "stale" migration flag and run migration again
+	// This tests if migrateToEncrypted is idempotent and doesn't double-encrypt
+	_, _ = s.db.Exec("DELETE FROM config WHERE key = 'data_migrated'")
+	
+	tx, err := s.db.Begin()
+	if err != nil { t.Fatal(err) }
+	err = s.migrateToEncrypted(tx, dataKey)
+	if err != nil {
+		t.Fatalf("Second migration failed: %v", err)
+	}
+	tx.Commit()
+
+	// 5. Verify data is STILL readable (not double-encrypted)
+	retrieved2, err := s.GetEntry(e1.ID)
+	if err != nil {
+		t.Fatalf("GetEntry failed after second migration: %v", err)
+	}
+	if retrieved2.Title != "Title 1" {
+		t.Errorf("Data double-encrypted or corrupted after second migration: got %q, want %q", retrieved2.Title, "Title 1")
 	}
 }

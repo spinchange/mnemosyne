@@ -222,7 +222,13 @@ func (s *SQLiteStore) Unlock(password []byte) ([]byte, error) {
 
 	aad := crypto.FormatAAD("config", "sentinel", 0)
 	decSentinel, err := crypto.Decrypt(verifyKey, encSentinel, aad)
-	if err != nil || string(decSentinel) != "mnemosyne-ok" {
+	if err != nil {
+		crypto.Zero(dataKey)
+		return nil, ErrWrongPassword
+	}
+	defer crypto.Zero(decSentinel)
+
+	if string(decSentinel) != "mnemosyne-ok" {
 		crypto.Zero(dataKey)
 		return nil, ErrWrongPassword
 	}
@@ -258,17 +264,44 @@ func (s *SQLiteStore) migrateToEncrypted(tx *sql.Tx, dataKey []byte) error {
 		}
 
 		var tStr, bStr string
-		if str, ok := title.(string); ok { tStr = str }
-		if str, ok := body.(string); ok { bStr = str }
+		isTitleEnc := false
+		isBodyEnc := false
+
+		if b, ok := title.([]byte); ok && len(b) > 0 && b[0] == crypto.Version1 {
+			isTitleEnc = true
+		} else if str, ok := title.(string); ok {
+			tStr = str
+		}
+
+		if b, ok := body.([]byte); ok && len(b) > 0 && b[0] == crypto.Version1 {
+			isBodyEnc = true
+		} else if str, ok := body.(string); ok {
+			bStr = str
+		}
+
+		if isTitleEnc && isBodyEnc {
+			continue // Skip already encrypted entry
+		}
 
 		// Use dataKey explicitly to avoid store session race
-		aadT := crypto.FormatAAD("entries", "title", id)
-		encTitle, err := crypto.Encrypt(dataKey, []byte(tStr), aadT)
-		if err != nil { return err }
+		var encTitle, encBody []byte
+		if !isTitleEnc {
+			aadT := crypto.FormatAAD("entries", "title", id)
+			var err error
+			encTitle, err = crypto.Encrypt(dataKey, []byte(tStr), aadT)
+			if err != nil { return err }
+		} else {
+			encTitle = title.([]byte)
+		}
 		
-		aadB := crypto.FormatAAD("entries", "body", id)
-		encBody, err := crypto.Encrypt(dataKey, []byte(bStr), aadB)
-		if err != nil { return err }
+		if !isBodyEnc {
+			aadB := crypto.FormatAAD("entries", "body", id)
+			var err error
+			encBody, err = crypto.Encrypt(dataKey, []byte(bStr), aadB)
+			if err != nil { return err }
+		} else {
+			encBody = body.([]byte)
+		}
 
 		entriesToUpdate = append(entriesToUpdate, entryUpdate{id, encTitle, encBody})
 	}
@@ -301,6 +334,10 @@ func (s *SQLiteStore) migrateToEncrypted(tx *sql.Tx, dataKey []byte) error {
 		var payload interface{}
 		if err := trows.Scan(&id, &payload); err != nil {
 			return err
+		}
+
+		if b, ok := payload.([]byte); ok && len(b) > 0 && b[0] == crypto.Version1 {
+			continue // Skip already encrypted trigger
 		}
 
 		var pStr string
@@ -572,15 +609,22 @@ func (s *SQLiteStore) SaveAll(entry *domain.Entry, sess *domain.WritingSession, 
 	defer tx.Rollback()
 
 	var bodyToStore interface{} = entry.Body
+	var titleToStore interface{} = entry.Title
 	if s.getKey() != nil {
 		encBody, err := s.encryptField("entries", "body", entry.ID, entry.Body)
 		if err != nil {
 			return err
 		}
 		bodyToStore = encBody
+
+		encTitle, err := s.encryptField("entries", "title", entry.ID, entry.Title)
+		if err != nil {
+			return err
+		}
+		titleToStore = encTitle
 	}
 
-	res, err := tx.Exec("UPDATE entries SET body = ?, word_count = ?, updated_at = ? WHERE id = ? AND NOT EXISTS (SELECT 1 FROM deleted_entries WHERE entry_id = ?)", bodyToStore, entry.WordCount, time.Now(), entry.ID, entry.ID)
+	res, err := tx.Exec("UPDATE entries SET title = ?, body = ?, word_count = ?, updated_at = ? WHERE id = ? AND NOT EXISTS (SELECT 1 FROM deleted_entries WHERE entry_id = ?)", titleToStore, bodyToStore, entry.WordCount, time.Now(), entry.ID, entry.ID)
 	if err != nil {
 		return err
 	}

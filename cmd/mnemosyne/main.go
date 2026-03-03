@@ -14,21 +14,21 @@ import (
 	"golang.org/x/term"
 )
 
-func getPaths() (dbPath, snapDir string) {
+func getPaths() (dbPath, appDir string) {
 	exePath, _ := os.Executable()
 	exeDir := filepath.Dir(exePath)
 	portableFile := filepath.Join(exeDir, ".portable")
 
 	if _, err := os.Stat(portableFile); err == nil {
 		// Portable mode: all data stays in the binary folder
-		return filepath.Join(exeDir, "mnemosyne.db"), filepath.Join(exeDir, "snapshots")
+		return filepath.Join(exeDir, "mnemosyne.db"), exeDir
 	}
 
 	// Normal mode: use user home directory
 	home, _ := os.UserHomeDir()
-	appDir := filepath.Join(home, ".mnemosyne")
+	appDir = filepath.Join(home, ".mnemosyne")
 	_ = os.MkdirAll(appDir, 0700)
-	return filepath.Join(appDir, "mnemosyne.db"), filepath.Join(appDir, "snapshots")
+	return filepath.Join(appDir, "mnemosyne.db"), appDir
 }
 
 func main() {
@@ -85,7 +85,7 @@ func runTUI() {
 	}
 	defer f.Close()
 
-	dbPath, snapDir := getPaths()
+	dbPath, appDir := getPaths()
 
 	s, err := store.NewSQLiteStore(dbPath)
 	if err != nil {
@@ -94,7 +94,7 @@ func runTUI() {
 	}
 	defer s.Close()
 
-	p := tea.NewProgram(app.NewModel(s, snapDir), tea.WithAltScreen())
+	p := tea.NewProgram(app.NewModel(s, appDir), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		log.Printf("Error running program: %v", err)
 		os.Exit(1)

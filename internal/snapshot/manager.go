@@ -39,6 +39,14 @@ func NewSnapshotManager(s *store.SQLiteStore, dir string) (*SnapshotManager, err
 	}, nil
 }
 
+func (m *SnapshotManager) SetMaxSnapshots(limit int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if limit > 0 {
+		m.maxSnapshots = limit
+	}
+}
+
 func (m *SnapshotManager) NotifyWrite(dataKey []byte) {
 	n := m.writeCount.Add(1)
 	

@@ -34,6 +34,7 @@ func CreateSnapshot(s *store.SQLiteStore, dataKey []byte, id uint64, path string
 	if err != nil {
 		return fmt.Errorf("marshal json: %w", err)
 	}
+	defer crypto.Zero(jsonData)
 
 	// 4. Gzip
 	var gzipped bytes.Buffer
@@ -44,6 +45,7 @@ func CreateSnapshot(s *store.SQLiteStore, dataKey []byte, id uint64, path string
 	if err := gw.Close(); err != nil {
 		return fmt.Errorf("gzip close: %w", err)
 	}
+	defer crypto.Zero(gzipped.Bytes())
 
 	// 5. Get Argon2 params for header
 	m, t, p, salt, err := s.GetArgon2Params()

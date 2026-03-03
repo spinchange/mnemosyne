@@ -43,6 +43,7 @@ func Restore(dbPath string, snapshotFile string, password []byte) error {
 	if err != nil {
 		return fmt.Errorf("decrypt snapshot: %w", err)
 	}
+	defer crypto.Zero(decrypted)
 
 	// 5. Decompress
 	gr, err := gzip.NewReader(bytes.NewReader(decrypted))
@@ -55,6 +56,7 @@ func Restore(dbPath string, snapshotFile string, password []byte) error {
 	if err != nil {
 		return fmt.Errorf("read gzipped data: %w", err)
 	}
+	defer crypto.Zero(jsonBytes)
 
 	// 6. Unmarshal
 	var snap Snapshot

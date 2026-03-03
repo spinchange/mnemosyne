@@ -3,12 +3,14 @@ package app
 import (
 	"errors"
 	"fmt"
+	"mnemosyne/internal/config"
 	"mnemosyne/internal/crypto"
 	"mnemosyne/internal/domain"
 	"mnemosyne/internal/parser"
 	"mnemosyne/internal/store"
 	"mnemosyne/internal/snapshot"
 	"mnemosyne/internal/ui"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -35,6 +37,7 @@ type autosaveMsg struct{}
 type Model struct {
 	mode             Mode
 	prevMode         Mode
+	config           config.Config
 	store            *store.SQLiteStore
 	snapshotManager  *snapshot.SnapshotManager
 	archiveMeta      *domain.ArchiveMeta
@@ -65,7 +68,7 @@ type Model struct {
 	err              error
 }
 
-func NewModel(s *store.SQLiteStore, snapDir string) Model {
+func NewModel(s *store.SQLiteStore, dataDir string) Model {
 	ta := textarea.New()
 	ta.Placeholder = "Write your heart out..."
 	ta.Focus()
@@ -97,10 +100,13 @@ func NewModel(s *store.SQLiteStore, snapDir string) Model {
 
 	initialStyles := ui.GetStyles(ui.Themes[0])
 
-	sm, _ := snapshot.NewSnapshotManager(s, snapDir)
+	conf := config.LoadConfig(config.GetConfigPath(dataDir))
+	sm, _ := snapshot.NewSnapshotManager(s, filepath.Join(dataDir, "snapshots"))
+	sm.SetMaxSnapshots(conf.SnapshotRetention)
 
 	m := Model{
 		mode:             ModeWelcome,
+		config:           conf,
 		store:            s,
 		snapshotManager:  sm,
 		editor:           ta,
@@ -136,15 +142,15 @@ func NewModel(s *store.SQLiteStore, snapDir string) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, tick(), autosave())
+	return tea.Batch(textarea.Blink, tick(), m.autosave())
 }
 
 func tick() tea.Cmd {
 	return tea.Every(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
-func autosave() tea.Cmd {
-	return tea.Every(5*time.Second, func(t time.Time) tea.Msg { return autosaveMsg{} })
+func (m Model) autosave() tea.Cmd {
+	return tea.Every(time.Duration(m.config.AutosaveSeconds)*time.Second, func(t time.Time) tea.Msg { return autosaveMsg{} })
 }
 
 // performLock saves dirty state, zeros key material, and returns to ModeUnlock.
@@ -512,7 +518,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		if m.dataKey != nil && m.mode != ModeUnlock {
-			if time.Since(m.lastInput) >= 10*time.Minute {
+			if time.Since(m.lastInput) >= time.Duration(m.config.AutoLockMinutes)*time.Minute {
 				return m.performLock()
 			}
 		}
@@ -531,7 +537,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if err != nil { m.err = err } else { m.triggers = trigs }
 			}
 		}
-		cmds = append(cmds, autosave())
+		cmds = append(cmds, m.autosave())
 	}
 
 	if m.mode == ModeDive {
@@ -568,24 +574,52 @@ func (m *Model) loadEntry(id int64) {
 }
 
 func (m *Model) updateLayout() {
+	// Ensure we have reasonable minimums
+	if m.width < 20 { m.width = 20 }
+	if m.height < 10 { m.height = 10 }
+
 	ew := m.width - 8
-	if m.mode == ModeSurface { ew = m.width - 45 }
-	m.editor.SetWidth(ew); m.editor.SetHeight(m.height - 10)
+	if m.mode == ModeSurface {
+		ew = m.width - 45 // 36 (HUD) + padding/gutters
+	}
+	
+	if ew < 20 { ew = 20 } // Minimum readable width
+	
+	m.editor.SetWidth(ew)
+	m.editor.SetHeight(m.height - 10)
+}
+
+func deriveTitle(body string) string {
+	lines := strings.Split(body, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			title := strings.TrimLeft(trimmed, "# ")
+			runes := []rune(title)
+			if len(runes) > 60 {
+				title = string(runes[:57]) + "..."
+			}
+			return title
+		}
+	}
+	return "Untitled Entry"
 }
 
 func (m *Model) save() {
 	body := m.editor.Value(); words := len(strings.Fields(body))
 	if words == 0 { return }
 	
+	title := deriveTitle(body)
+
 	if m.entry == nil {
-		m.entry = &domain.Entry{Title: "Untitled Entry", Body: body, WordCount: words}
+		m.entry = &domain.Entry{Title: title, Body: body, WordCount: words}
 		if err := m.store.CreateEntry(m.entry); err != nil {
 			m.err = fmt.Errorf("initial save failed: %w", err)
 			m.entry = nil 
 			return
 		}
 	} else {
-		m.entry.Body = body; m.entry.WordCount = words
+		m.entry.Title = title; m.entry.Body = body; m.entry.WordCount = words
 	}
 	
 	if m.session == nil {
@@ -772,8 +806,7 @@ func (m Model) View() string {
 	}
 
 	if m.mode == ModeSurface {
-		ruleWidth := m.width / 3
-		if ruleWidth > 28 { ruleWidth = 28 }
+		ruleWidth := 28
 		rule := m.styles.Divider.Render(strings.Repeat("─", ruleWidth))
 		var hb strings.Builder
 
@@ -793,7 +826,13 @@ func (m Model) View() string {
 
 		if len(m.triggers) > 0 {
 			hb.WriteString(m.styles.SectionHead.Render("METRICS") + "\n")
-			for _, t := range m.triggers { hb.WriteString(m.styles.Trigger.Render(t.Prefix+":") + " " + t.Payload + "\n") }
+			for _, t := range m.triggers {
+				payload := t.Payload
+				if len([]rune(payload)) > 20 {
+					payload = string([]rune(payload)[:17]) + "..."
+				}
+				hb.WriteString(m.styles.Trigger.Render(t.Prefix+":") + " " + payload + "\n")
+			}
 			hb.WriteString("\n" + rule + "\n\n")
 		}
 
@@ -824,7 +863,7 @@ func (m Model) View() string {
 			}
 		}
 		
-		hv := m.styles.HUD.Height(m.height - 4).Render(hb.String())
+		hv := m.styles.HUD.Height(m.height - 6).Render(hb.String())
 		ev := m.styles.Editor.Render(m.editor.View())
 		return m.styles.Main.Render(lipgloss.JoinHorizontal(lipgloss.Top, ev, hv))
 	}

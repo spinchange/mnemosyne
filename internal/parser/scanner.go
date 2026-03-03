@@ -1,8 +1,10 @@
 package parser
 
 import (
+	"bufio"
 	"bytes"
 	"mnemosyne/internal/domain"
+	"strings"
 	"time"
 )
 
@@ -36,11 +38,21 @@ func ScanLine(lineNo int, entryID int64, sessionID int64, line []byte) (*domain.
 
 func ScanContent(entryID int64, sessionID int64, content string) []domain.Trigger {
 	var triggers []domain.Trigger
-	lines := bytes.Split([]byte(content), []byte("\n"))
-	for i, line := range lines {
-		if t, ok := ScanLine(i+1, entryID, sessionID, line); ok {
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	
+	// Increase buffer limit to 1MiB for exceptionally long lines
+	buf := make([]byte, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	lineNo := 1
+	for scanner.Scan() {
+		if t, ok := ScanLine(lineNo, entryID, sessionID, scanner.Bytes()); ok {
 			triggers = append(triggers, *t)
 		}
+		lineNo++
 	}
+	
+	// Log or handle scanner.Err() if necessary, though for strings it's rare 
+	// unless a line exceeds the 1MiB buffer.
 	return triggers
 }
