@@ -28,6 +28,12 @@ func LoadConfig(path string) Config {
 		return c
 	}
 	_ = yaml.Unmarshal(data, &c)
+	if c.AutosaveSeconds < 1 {
+		c.AutosaveSeconds = DefaultConfig().AutosaveSeconds
+	}
+	if c.AutoLockMinutes < 0 {
+		c.AutoLockMinutes = DefaultConfig().AutoLockMinutes
+	}
 	return c
 }
 

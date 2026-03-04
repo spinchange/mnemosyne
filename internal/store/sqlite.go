@@ -79,20 +79,20 @@ func (s *SQLiteStore) decryptField(table, field string, rowID int64, ciphertext 
 	if err != nil {
 		return "", err
 	}
-	return string(plaintext), nil
+	res := string(plaintext)
+	crypto.Zero(plaintext)
+	return res, nil
 }
 
 // decryptWithKey is a helper for snapshot/migration where we already have the key copy.
-func (s *SQLiteStore) decryptWithKey(key []byte, table, field string, rowID int64, ciphertext []byte) (string, error) {
+func (s *SQLiteStore) decryptWithKey(key []byte, table, field string, rowID int64, ciphertext []byte) ([]byte, error) {
 	if key == nil {
-		return string(ciphertext), nil
+		cp := make([]byte, len(ciphertext))
+		copy(cp, ciphertext)
+		return cp, nil
 	}
 	aad := crypto.FormatAAD(table, field, rowID)
-	plaintext, err := crypto.Decrypt(key, ciphertext, aad)
-	if err != nil {
-		return "", err
-	}
-	return string(plaintext), nil
+	return crypto.Decrypt(key, ciphertext, aad)
 }
 
 func (s *SQLiteStore) IsEncryptionEnabled() (bool, error) {
@@ -181,7 +181,7 @@ func (s *SQLiteStore) SetupEncryption(password []byte) ([]byte, error) {
 	}
 
 	s.SetKey(dataKey)
-	return dataKey, nil // dataKey is copied by SetKey, caller gets the original to use/zero
+	return dataKey, nil
 }
 
 func (s *SQLiteStore) Unlock(password []byte) ([]byte, error) {
@@ -243,7 +243,6 @@ func (s *SQLiteStore) migrateToEncrypted(tx *sql.Tx, dataKey []byte) error {
 		return nil
 	}
 
-	// Entries
 	rows, err := tx.Query("SELECT id, title, body FROM entries")
 	if err != nil {
 		return err
@@ -263,32 +262,31 @@ func (s *SQLiteStore) migrateToEncrypted(tx *sql.Tx, dataKey []byte) error {
 			return err
 		}
 
-		var tStr, bStr string
+		var tBytes, bBytes []byte
 		isTitleEnc := false
 		isBodyEnc := false
 
 		if b, ok := title.([]byte); ok && len(b) > 0 && b[0] == crypto.Version1 {
 			isTitleEnc = true
 		} else if str, ok := title.(string); ok {
-			tStr = str
+			tBytes = []byte(str)
 		}
 
 		if b, ok := body.([]byte); ok && len(b) > 0 && b[0] == crypto.Version1 {
 			isBodyEnc = true
 		} else if str, ok := body.(string); ok {
-			bStr = str
+			bBytes = []byte(str)
 		}
 
 		if isTitleEnc && isBodyEnc {
-			continue // Skip already encrypted entry
+			continue
 		}
 
-		// Use dataKey explicitly to avoid store session race
 		var encTitle, encBody []byte
 		if !isTitleEnc {
 			aadT := crypto.FormatAAD("entries", "title", id)
 			var err error
-			encTitle, err = crypto.Encrypt(dataKey, []byte(tStr), aadT)
+			encTitle, err = crypto.Encrypt(dataKey, tBytes, aadT)
 			if err != nil { return err }
 		} else {
 			encTitle = title.([]byte)
@@ -297,7 +295,7 @@ func (s *SQLiteStore) migrateToEncrypted(tx *sql.Tx, dataKey []byte) error {
 		if !isBodyEnc {
 			aadB := crypto.FormatAAD("entries", "body", id)
 			var err error
-			encBody, err = crypto.Encrypt(dataKey, []byte(bStr), aadB)
+			encBody, err = crypto.Encrypt(dataKey, bBytes, aadB)
 			if err != nil { return err }
 		} else {
 			encBody = body.([]byte)
@@ -317,7 +315,6 @@ func (s *SQLiteStore) migrateToEncrypted(tx *sql.Tx, dataKey []byte) error {
 		}
 	}
 
-	// Triggers
 	trows, err := tx.Query("SELECT id, payload FROM entry_triggers")
 	if err != nil {
 		return err
@@ -337,14 +334,14 @@ func (s *SQLiteStore) migrateToEncrypted(tx *sql.Tx, dataKey []byte) error {
 		}
 
 		if b, ok := payload.([]byte); ok && len(b) > 0 && b[0] == crypto.Version1 {
-			continue // Skip already encrypted trigger
+			continue
 		}
 
-		var pStr string
-		if str, ok := payload.(string); ok { pStr = str }
+		var pBytes []byte
+		if str, ok := payload.(string); ok { pBytes = []byte(str) }
 
 		aadP := crypto.FormatAAD("entry_triggers", "payload", id)
-		encPayload, err := crypto.Encrypt(dataKey, []byte(pStr), aadP)
+		encPayload, err := crypto.Encrypt(dataKey, pBytes, aadP)
 		if err != nil { return err }
 		triggersToUpdate = append(triggersToUpdate, triggerUpdate{id, encPayload})
 	}
@@ -364,20 +361,135 @@ func (s *SQLiteStore) migrateToEncrypted(tx *sql.Tx, dataKey []byte) error {
 	return err
 }
 
+func (s *SQLiteStore) reEncryptData(tx *sql.Tx, oldKey, newKey []byte) error {
+	rows, err := tx.Query("SELECT id, title, body FROM entries")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type entryUpdate struct {
+		id    int64
+		title []byte
+		body  []byte
+	}
+	var entriesToUpdate []entryUpdate
+	for rows.Next() {
+		var id int64
+		var title, body interface{}
+		if err := rows.Scan(&id, &title, &body); err != nil {
+			return err
+		}
+
+		var plainTitle, plainBody []byte
+		if b, ok := title.([]byte); ok {
+			var err error
+			plainTitle, err = s.decryptWithKey(oldKey, "entries", "title", id, b)
+			if err != nil {
+				return fmt.Errorf("re-encrypt: decrypt title %d: %w", id, err)
+			}
+		} else if str, ok := title.(string); ok {
+			plainTitle = []byte(str)
+		}
+		if b, ok := body.([]byte); ok {
+			var err error
+			plainBody, err = s.decryptWithKey(oldKey, "entries", "body", id, b)
+			if err != nil {
+				return fmt.Errorf("re-encrypt: decrypt body %d: %w", id, err)
+			}
+		} else if str, ok := body.(string); ok {
+			plainBody = []byte(str)
+		}
+
+		aadT := crypto.FormatAAD("entries", "title", id)
+		encTitle, err := crypto.Encrypt(newKey, plainTitle, aadT)
+		crypto.Zero(plainTitle)
+		if err != nil {
+			return fmt.Errorf("re-encrypt: encrypt title %d: %w", id, err)
+		}
+		aadB := crypto.FormatAAD("entries", "body", id)
+		encBody, err := crypto.Encrypt(newKey, plainBody, aadB)
+		crypto.Zero(plainBody)
+		if err != nil {
+			return fmt.Errorf("re-encrypt: encrypt body %d: %w", id, err)
+		}
+
+		entriesToUpdate = append(entriesToUpdate, entryUpdate{id, encTitle, encBody})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+
+	for _, u := range entriesToUpdate {
+		if _, err := tx.Exec("UPDATE entries SET title = ?, body = ? WHERE id = ?", u.title, u.body, u.id); err != nil {
+			return err
+		}
+	}
+
+	trows, err := tx.Query("SELECT id, payload FROM entry_triggers")
+	if err != nil {
+		return err
+	}
+	defer trows.Close()
+
+	type triggerUpdate struct {
+		id      int64
+		payload []byte
+	}
+	var triggersToUpdate []triggerUpdate
+	for trows.Next() {
+		var id int64
+		var payload interface{}
+		if err := trows.Scan(&id, &payload); err != nil {
+			return err
+		}
+
+		var plainPayload []byte
+		if b, ok := payload.([]byte); ok {
+			var err error
+			plainPayload, err = s.decryptWithKey(oldKey, "entry_triggers", "payload", id, b)
+			if err != nil {
+				return fmt.Errorf("re-encrypt: decrypt payload %d: %w", id, err)
+			}
+		} else if str, ok := payload.(string); ok {
+			plainPayload = []byte(str)
+		}
+
+		aadP := crypto.FormatAAD("entry_triggers", "payload", id)
+		encPayload, err := crypto.Encrypt(newKey, plainPayload, aadP)
+		crypto.Zero(plainPayload)
+		if err != nil {
+			return fmt.Errorf("re-encrypt: encrypt payload %d: %w", id, err)
+		}
+		triggersToUpdate = append(triggersToUpdate, triggerUpdate{id, encPayload})
+	}
+	if err := trows.Err(); err != nil {
+		return err
+	}
+	trows.Close()
+
+	for _, u := range triggersToUpdate {
+		if _, err := tx.Exec("UPDATE entry_triggers SET payload = ? WHERE id = ?", u.payload, u.id); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (s *SQLiteStore) ChangePassword(oldPassword, newPassword []byte) ([]byte, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	defer crypto.Zero(oldPassword)
 	defer crypto.Zero(newPassword)
 
-	// 1. Verify old password and get current dataKey
 	currentDataKey, err := s.Unlock(oldPassword)
 	if err != nil {
 		return nil, err
 	}
 	defer crypto.Zero(currentDataKey)
 
-	// 2. Derive new keys with fresh salt
 	newSalt := make([]byte, 16)
 	if _, err := io.ReadFull(rand.Reader, newSalt); err != nil {
 		return nil, err
@@ -393,7 +505,6 @@ func (s *SQLiteStore) ChangePassword(oldPassword, newPassword []byte) ([]byte, e
 	}
 	defer crypto.Zero(verifyKey)
 
-	// 3. Encrypt new sentinel
 	aad := crypto.FormatAAD("config", "sentinel", 0)
 	encSentinel, err := crypto.Encrypt(verifyKey, []byte("mnemosyne-ok"), aad)
 	if err != nil {
@@ -430,6 +541,11 @@ func (s *SQLiteStore) ChangePassword(oldPassword, newPassword []byte) ([]byte, e
 		}
 	}
 
+	if err := s.reEncryptData(tx, currentDataKey, dataKey); err != nil {
+		crypto.Zero(dataKey)
+		return nil, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		crypto.Zero(dataKey)
 		return nil, err
@@ -438,10 +554,7 @@ func (s *SQLiteStore) ChangePassword(oldPassword, newPassword []byte) ([]byte, e
 	s.SetKey(dataKey)
 	_ = s.Vacuum()
 
-	// Return copy for model
-	resKey := make([]byte, len(dataKey))
-	copy(resKey, dataKey)
-	return resKey, nil
+	return dataKey, nil
 }
 
 func (s *SQLiteStore) Vacuum() error {
@@ -529,6 +642,8 @@ func (s *SQLiteStore) initSchema() error {
 		key   TEXT PRIMARY KEY,
 		value BLOB NOT NULL
 	);
+
+	CREATE INDEX IF NOT EXISTS idx_entry_triggers_entry_id ON entry_triggers(entry_id);
 	`
 	_, err := s.db.Exec(schema)
 	return err
@@ -545,7 +660,6 @@ func (s *SQLiteStore) CreateEntry(entry *domain.Entry) error {
 	defer tx.Rollback()
 
 	now := time.Now()
-	// Initial insert with plaintext to get ID
 	res, err := tx.Exec("INSERT INTO entries (title, body, word_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", entry.Title, entry.Body, entry.WordCount, now, now)
 	if err != nil {
 		return err
@@ -633,8 +747,12 @@ func (s *SQLiteStore) SaveAll(entry *domain.Entry, sess *domain.WritingSession, 
 		return ErrEntryDeleted
 	}
 
-	_, _ = tx.Exec("UPDATE writing_sessions SET ended_at = ?, elapsed_active_ms = ?, words_added = ? WHERE id = ?", sess.EndedAt, int64(sess.ElapsedActive/time.Millisecond), sess.WordsAdded, sess.ID)
-	_, _ = tx.Exec("DELETE FROM entry_triggers WHERE entry_id = ? AND session_id = ?", entry.ID, sess.ID)
+	if _, err := tx.Exec("UPDATE writing_sessions SET ended_at = ?, elapsed_active_ms = ?, words_added = ? WHERE id = ?", sess.EndedAt, int64(sess.ElapsedActive/time.Millisecond), sess.WordsAdded, sess.ID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM entry_triggers WHERE entry_id = ? AND session_id = ?", entry.ID, sess.ID); err != nil {
+		return err
+	}
 	for _, t := range trigs {
 		if s.getKey() != nil {
 			res, err := tx.Exec("INSERT INTO entry_triggers (entry_id, session_id, line_no, prefix, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)", entry.ID, sess.ID, t.LineNo, t.Prefix, "", t.CreatedAt)
@@ -659,8 +777,12 @@ func (s *SQLiteStore) SaveAll(entry *domain.Entry, sess *domain.WritingSession, 
 	}
 
 	if s.getKey() == nil {
-		_, _ = tx.Exec("DELETE FROM entries_fts WHERE rowid = ?", entry.ID)
-		_, _ = tx.Exec("INSERT INTO entries_fts(rowid, title, body) VALUES (?, ?, ?)", entry.ID, entry.Title, entry.Body)
+		if _, err := tx.Exec("DELETE FROM entries_fts WHERE rowid = ?", entry.ID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("INSERT INTO entries_fts(rowid, title, body) VALUES (?, ?, ?)", entry.ID, entry.Title, entry.Body); err != nil {
+			return err
+		}
 	}
 
 	return tx.Commit()
@@ -745,7 +867,6 @@ func (s *SQLiteStore) GetEntry(id int64) (*domain.Entry, error) {
 
 func (s *SQLiteStore) SearchEntries(query string) ([]domain.Entry, error) {
 	if s.getKey() == nil {
-		// Existing FTS5 path using robust subquery pattern
 		rows, err := s.db.Query(`
 			SELECT id, title, word_count, created_at 
 			FROM entries 
@@ -773,7 +894,6 @@ func (s *SQLiteStore) SearchEntries(query string) ([]domain.Entry, error) {
 		return entries, nil
 	}
 
-	// Encryption enabled: in-memory search
 	rows, err := s.db.Query("SELECT id, title, body, word_count, created_at FROM entries")
 	if err != nil {
 		return nil, err
@@ -791,15 +911,19 @@ func (s *SQLiteStore) SearchEntries(query string) ([]domain.Entry, error) {
 
 		var decTitle, decBody string
 		if b, ok := title.([]byte); ok {
-			decTitle, err = s.decryptField("entries", "title", e.ID, b)
+			plain, err := s.decryptWithKey(s.dataKey, "entries", "title", e.ID, b)
 			if err != nil { return nil, err }
+			decTitle = string(plain)
+			crypto.Zero(plain)
 		} else if str, ok := title.(string); ok {
 			decTitle = str
 		}
 
 		if b, ok := body.([]byte); ok {
-			decBody, err = s.decryptField("entries", "body", e.ID, b)
+			plain, err := s.decryptWithKey(s.dataKey, "entries", "body", e.ID, b)
 			if err != nil { return nil, err }
+			decBody = string(plain)
+			crypto.Zero(plain)
 		} else if str, ok := body.(string); ok {
 			decBody = str
 		}
@@ -858,21 +982,13 @@ func (s *SQLiteStore) GetLatestTriggers(entryID int64) ([]domain.Trigger, error)
 func (s *SQLiteStore) GetArgon2Params() (m, t uint32, p uint8, salt []byte, err error) {
 	var mBytes, tBytes, pBytes []byte
 	err = s.db.QueryRow("SELECT value FROM config WHERE key = 'argon2_salt'").Scan(&salt)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	err = s.db.QueryRow("SELECT value FROM config WHERE key = 'argon2_m'").Scan(&mBytes)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	err = s.db.QueryRow("SELECT value FROM config WHERE key = 'argon2_t'").Scan(&tBytes)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	err = s.db.QueryRow("SELECT value FROM config WHERE key = 'argon2_p'").Scan(&pBytes)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 
 	m = binary.LittleEndian.Uint32(mBytes)
 	t = binary.LittleEndian.Uint32(tBytes)
@@ -881,8 +997,13 @@ func (s *SQLiteStore) GetArgon2Params() (m, t uint32, p uint8, salt []byte, err 
 }
 
 func (s *SQLiteStore) ExportData(key []byte) ([]domain.Entry, []domain.Trigger, error) {
-	// 1. Fetch and decrypt all entries
-	rows, err := s.db.Query("SELECT id, title, body, word_count, created_at FROM entries")
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query("SELECT id, title, body, word_count, created_at FROM entries")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -898,16 +1019,18 @@ func (s *SQLiteStore) ExportData(key []byte) ([]domain.Entry, []domain.Trigger, 
 
 		if key != nil {
 			if b, ok := title.([]byte); ok {
-				decTitle, err := s.decryptWithKey(key, "entries", "title", e.ID, b)
+				plain, err := s.decryptWithKey(key, "entries", "title", e.ID, b)
 				if err != nil { return nil, nil, err }
-				e.Title = decTitle
+				e.Title = string(plain)
+				crypto.Zero(plain)
 			} else if str, ok := title.(string); ok {
 				e.Title = str
 			}
 			if b, ok := body.([]byte); ok {
-				decBody, err := s.decryptWithKey(key, "entries", "body", e.ID, b)
+				plain, err := s.decryptWithKey(key, "entries", "body", e.ID, b)
 				if err != nil { return nil, nil, err }
-				e.Body = decBody
+				e.Body = string(plain)
+				crypto.Zero(plain)
 			} else if str, ok := body.(string); ok {
 				e.Body = str
 			}
@@ -920,9 +1043,9 @@ func (s *SQLiteStore) ExportData(key []byte) ([]domain.Entry, []domain.Trigger, 
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
 	}
+	rows.Close()
 
-	// 2. Fetch and decrypt all triggers
-	trows, err := s.db.Query("SELECT id, entry_id, session_id, line_no, prefix, payload, created_at FROM entry_triggers")
+	trows, err := tx.Query("SELECT id, entry_id, session_id, line_no, prefix, payload, created_at FROM entry_triggers")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -938,9 +1061,10 @@ func (s *SQLiteStore) ExportData(key []byte) ([]domain.Entry, []domain.Trigger, 
 
 		if key != nil {
 			if b, ok := payload.([]byte); ok {
-				decPayload, err := s.decryptWithKey(key, "entry_triggers", "payload", t.ID, b)
+				plain, err := s.decryptWithKey(key, "entry_triggers", "payload", t.ID, b)
 				if err != nil { return nil, nil, err }
-				t.Payload = decPayload
+				t.Payload = string(plain)
+				crypto.Zero(plain)
 			} else if str, ok := payload.(string); ok {
 				t.Payload = str
 			}
@@ -989,7 +1113,6 @@ func (s *SQLiteStore) ImportEntry(entry domain.Entry) error {
 	}
 	defer tx.Rollback()
 
-	// 1. Insert into entries
 	if s.getKey() != nil {
 		encTitle, err := s.encryptField("entries", "title", entry.ID, entry.Title)
 		if err != nil { return err }
@@ -1046,7 +1169,6 @@ func (s *SQLiteStore) SetupRestore(password []byte, salt []byte, m, t uint32, p 
 	defer crypto.Zero(dataKey)
 	defer crypto.Zero(verifyKey)
 
-	// Encrypt sentinel
 	aad := crypto.FormatAAD("config", "sentinel", 0)
 	encSentinel, err := crypto.Encrypt(verifyKey, []byte("mnemosyne-ok"), aad)
 	if err != nil {
@@ -1107,11 +1229,16 @@ func parseDriverTime(s string) (time.Time, error) {
 }
 
 func (s *SQLiteStore) GetArchiveMeta() (*domain.ArchiveMeta, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
 	meta := &domain.ArchiveMeta{}
 
-	// 1. Basic aggregates (plaintext fields)
 	var firstStr, lastStr sql.NullString
-	err := s.db.QueryRow("SELECT COUNT(*), COALESCE(SUM(word_count), 0), MIN(created_at), MAX(created_at) FROM entries").
+	err = tx.QueryRow("SELECT COUNT(*), COALESCE(SUM(word_count), 0), MIN(created_at), MAX(created_at) FROM entries").
 		Scan(&meta.TotalEntries, &meta.TotalWords, &firstStr, &lastStr)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, err
@@ -1132,13 +1259,11 @@ func (s *SQLiteStore) GetArchiveMeta() (*domain.ArchiveMeta, error) {
 		meta.AvgWordsPerEntry = meta.TotalWords / meta.TotalEntries
 	}
 
-	// 2. Active time
 	var activeMs sql.NullInt64
-	_ = s.db.QueryRow("SELECT SUM(elapsed_active_ms) FROM writing_sessions").Scan(&activeMs)
+	_ = tx.QueryRow("SELECT SUM(elapsed_active_ms) FROM writing_sessions").Scan(&activeMs)
 	meta.TotalActiveMs = activeMs.Int64
 
-	// 3. Top Triggers
-	trows, err := s.db.Query("SELECT prefix, COUNT(*) as cnt FROM entry_triggers GROUP BY prefix ORDER BY cnt DESC LIMIT 5")
+	trows, err := tx.Query("SELECT prefix, COUNT(*) as cnt FROM entry_triggers GROUP BY prefix ORDER BY cnt DESC LIMIT 5")
 	if err == nil {
 		defer trows.Close()
 		for trows.Next() {
@@ -1150,10 +1275,10 @@ func (s *SQLiteStore) GetArchiveMeta() (*domain.ArchiveMeta, error) {
 		if err := trows.Err(); err != nil {
 			return nil, err
 		}
+		trows.Close()
 	}
 
-	// 4. Most active day & Streaks (Calculated from all entry dates)
-	rows, err := s.db.Query("SELECT created_at FROM entries ORDER BY created_at ASC")
+	rows, err := tx.Query("SELECT created_at FROM entries ORDER BY created_at ASC")
 	if err == nil {
 		defer rows.Close()
 		dayCounts := make(map[time.Weekday]int)
@@ -1162,7 +1287,6 @@ func (s *SQLiteStore) GetArchiveMeta() (*domain.ArchiveMeta, error) {
 			var t time.Time
 			if err := rows.Scan(&t); err == nil {
 				dayCounts[t.Weekday()]++
-				// Normalize to local date for streak calculation
 				y, m, d := t.Date()
 				dates = append(dates, time.Date(y, m, d, 0, 0, 0, 0, time.Local))
 			}
@@ -1170,8 +1294,8 @@ func (s *SQLiteStore) GetArchiveMeta() (*domain.ArchiveMeta, error) {
 		if err := rows.Err(); err != nil {
 			return nil, err
 		}
+		rows.Close()
 
-		// Most active day
 		maxCnt := -1
 		for wd, cnt := range dayCounts {
 			if cnt > maxCnt {
@@ -1180,7 +1304,6 @@ func (s *SQLiteStore) GetArchiveMeta() (*domain.ArchiveMeta, error) {
 			}
 		}
 
-		// Streak calculation
 		if len(dates) > 0 {
 			uniqueDates := make(map[int64]bool)
 			for _, d := range dates { uniqueDates[d.Unix()] = true }
@@ -1190,8 +1313,6 @@ func (s *SQLiteStore) GetArchiveMeta() (*domain.ArchiveMeta, error) {
 			sort.Slice(sortedDates, func(i, j int) bool { return sortedDates[i] < sortedDates[j] })
 
 			longest := 0
-			
-			// Today's normalized date
 			ty, tm, td := time.Now().Date()
 			today := time.Date(ty, tm, td, 0, 0, 0, 0, time.Local)
 			yesterday := today.AddDate(0, 0, -1).Unix()
@@ -1208,10 +1329,8 @@ func (s *SQLiteStore) GetArchiveMeta() (*domain.ArchiveMeta, error) {
 			}
 			meta.LongestStreak = longest
 
-			// Current streak check (must include today or yesterday)
 			lastDate := sortedDates[len(sortedDates)-1]
 			if lastDate == todayUnix || lastDate == yesterday {
-				// Walk backwards using calendar math
 				c := 0
 				target := time.Unix(lastDate, 0)
 				for i := len(sortedDates)-1; i >= 0; i-- {
@@ -1238,8 +1357,12 @@ func (s *SQLiteStore) DeleteEntry(id int64) error {
 		return err
 	}
 	defer tx.Rollback()
-	_, _ = tx.Exec("INSERT INTO deleted_entries (entry_id, deleted_at) VALUES (?, ?) ON CONFLICT(entry_id) DO UPDATE SET deleted_at = excluded.deleted_at", id, time.Now())
-	_, _ = tx.Exec("DELETE FROM entries_fts WHERE rowid = ?", id)
+	if _, err := tx.Exec("INSERT INTO deleted_entries (entry_id, deleted_at) VALUES (?, ?) ON CONFLICT(entry_id) DO UPDATE SET deleted_at = excluded.deleted_at", id, time.Now()); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM entries_fts WHERE rowid = ?", id); err != nil {
+		return err
+	}
 	res, err := tx.Exec("DELETE FROM entries WHERE id = ?", id)
 	if err != nil {
 		return err

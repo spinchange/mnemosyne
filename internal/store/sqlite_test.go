@@ -5,6 +5,7 @@ import (
 	"mnemosyne/internal/domain"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestSetupAndUnlock(t *testing.T) {
@@ -117,6 +118,71 @@ func TestSearch(t *testing.T) {
 	}
 }
 
+func TestChangePassword(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "changepwd.db")
+
+	s, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer s.Close()
+
+	// 1. Setup encryption and create entry
+	_, err = s.SetupEncryption([]byte("old-password"))
+	if err != nil {
+		t.Fatalf("SetupEncryption failed: %v", err)
+	}
+
+	entry := &domain.Entry{
+		Title: "Test Title",
+		Body:  "Test Body Content",
+	}
+	if err := s.CreateEntry(entry); err != nil {
+		t.Fatalf("CreateEntry failed: %v", err)
+	}
+
+	// 2. Change password
+	newKey, err := s.ChangePassword([]byte("old-password"), []byte("new-password"))
+	if err != nil {
+		t.Fatalf("ChangePassword failed: %v", err)
+	}
+	crypto.Zero(newKey)
+
+	// 3. Simulate lock
+	s.SetKey(nil)
+
+	// 4. Unlock with new password
+	dataKey, err := s.Unlock([]byte("new-password"))
+	if err != nil {
+		t.Fatalf("Unlock with new password failed: %v", err)
+	}
+	defer crypto.Zero(dataKey)
+	s.SetKey(dataKey)
+
+	// 5. Verify entry is readable and matches original
+	retrieved, err := s.GetEntry(entry.ID)
+	if err != nil {
+		t.Fatalf("GetEntry failed after password change: %v", err)
+	}
+	if retrieved.Title != entry.Title {
+		t.Errorf("Title mismatch after password change: got %q, want %q", retrieved.Title, entry.Title)
+	}
+	if retrieved.Body != entry.Body {
+		t.Errorf("Body mismatch after password change: got %q, want %q", retrieved.Body, entry.Body)
+	}
+
+	// Negative case: old password no longer works
+	s.SetKey(nil)
+	oldKey, err := s.Unlock([]byte("old-password"))
+	if oldKey != nil {
+		crypto.Zero(oldKey)
+	}
+	if err != ErrWrongPassword {
+		t.Errorf("Expected ErrWrongPassword for old password after change, got %v", err)
+	}
+}
+
 func TestMigrationResilience(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "resilience.db")
@@ -164,5 +230,109 @@ func TestMigrationResilience(t *testing.T) {
 	}
 	if retrieved2.Title != "Title 1" {
 		t.Errorf("Data double-encrypted or corrupted after second migration: got %q, want %q", retrieved2.Title, "Title 1")
+	}
+}
+
+func TestGetArchiveMeta_Empty(t *testing.T) {
+	s, _ := NewSQLiteStore(filepath.Join(t.TempDir(), "meta_empty.db"))
+	defer s.Close()
+
+	meta, err := s.GetArchiveMeta()
+	if err != nil {
+		t.Fatalf("GetArchiveMeta on empty DB: %v", err)
+	}
+	if meta.TotalEntries != 0 || meta.TotalWords != 0 || meta.CurrentStreak != 0 || meta.LongestStreak != 0 {
+		t.Errorf("expected all zeros on empty DB, got %+v", meta)
+	}
+}
+
+func TestGetArchiveMeta(t *testing.T) {
+	s, err := NewSQLiteStore(filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	// noon local — avoids timezone boundary issues in streak date normalization
+	day := func(offset int) time.Time {
+		d := now.AddDate(0, 0, offset)
+		return time.Date(d.Year(), d.Month(), d.Day(), 12, 0, 0, 0, time.Local)
+	}
+
+	// Entries: days -5,-4,-3 (streak of 3), gap at -2, days -1,0 (current streak of 2)
+	entries := []struct {
+		date  time.Time
+		words int
+	}{
+		{day(-5), 100},
+		{day(-4), 200},
+		{day(-3), 150},
+		{day(-1), 250},
+		{day(0), 300},
+	}
+	for _, e := range entries {
+		if _, err := s.db.Exec(
+			"INSERT INTO entries (title, body, word_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+			"title", "body", e.words, e.date, e.date,
+		); err != nil {
+			t.Fatalf("insert entry: %v", err)
+		}
+	}
+	// entry IDs are 1-5
+
+	// One writing session: 90 seconds active
+	if _, err := s.db.Exec(
+		"INSERT INTO writing_sessions (entry_id, started_at, elapsed_active_ms, words_added) VALUES (?, ?, ?, ?)",
+		1, day(0), 90000, 300,
+	); err != nil {
+		t.Fatalf("insert session: %v", err)
+	}
+	// session ID is 1
+
+	// Triggers on entry 1: MOOD x3, ENERGY x1
+	for i, prefix := range []string{"MOOD", "MOOD", "ENERGY", "MOOD"} {
+		if _, err := s.db.Exec(
+			"INSERT INTO entry_triggers (entry_id, session_id, line_no, prefix, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+			1, 1, i+1, prefix, "value", day(0),
+		); err != nil {
+			t.Fatalf("insert trigger: %v", err)
+		}
+	}
+
+	meta, err := s.GetArchiveMeta()
+	if err != nil {
+		t.Fatalf("GetArchiveMeta: %v", err)
+	}
+
+	if meta.TotalEntries != 5 {
+		t.Errorf("TotalEntries: got %d, want 5", meta.TotalEntries)
+	}
+	if meta.TotalWords != 1000 {
+		t.Errorf("TotalWords: got %d, want 1000", meta.TotalWords)
+	}
+	if meta.AvgWordsPerEntry != 200 {
+		t.Errorf("AvgWordsPerEntry: got %d, want 200", meta.AvgWordsPerEntry)
+	}
+	if meta.TotalActiveMs != 90000 {
+		t.Errorf("TotalActiveMs: got %d, want 90000", meta.TotalActiveMs)
+	}
+
+	if len(meta.TopTriggers) != 2 {
+		t.Fatalf("TopTriggers count: got %d, want 2", len(meta.TopTriggers))
+	}
+	if meta.TopTriggers[0].Prefix != "MOOD" || meta.TopTriggers[0].Count != 3 {
+		t.Errorf("TopTriggers[0]: got %+v, want {MOOD 3}", meta.TopTriggers[0])
+	}
+	if meta.TopTriggers[1].Prefix != "ENERGY" || meta.TopTriggers[1].Count != 1 {
+		t.Errorf("TopTriggers[1]: got %+v, want {ENERGY 1}", meta.TopTriggers[1])
+	}
+
+	// days -5,-4,-3 = longest run of 3; gap at -2; days -1,0 = current streak of 2
+	if meta.LongestStreak != 3 {
+		t.Errorf("LongestStreak: got %d, want 3", meta.LongestStreak)
+	}
+	if meta.CurrentStreak != 2 {
+		t.Errorf("CurrentStreak: got %d, want 2", meta.CurrentStreak)
 	}
 }

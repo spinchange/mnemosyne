@@ -11,6 +11,10 @@ import (
 	"time"
 )
 
+// AppVersion is embedded in every snapshot. Override with -ldflags at build time:
+// -ldflags "-X mnemosyne/internal/snapshot.AppVersion=1.2.0"
+var AppVersion = "1.1.0"
+
 func CreateSnapshot(s *store.SQLiteStore, dataKey []byte, id uint64, path string) error {
 	// 1. Fetch data using provided key to avoid store session race
 	entries, triggers, err := s.ExportData(dataKey)
@@ -21,7 +25,7 @@ func CreateSnapshot(s *store.SQLiteStore, dataKey []byte, id uint64, path string
 	// 2. Construct Snapshot
 	snap := Snapshot{
 		SchemaVersion: 1,
-		AppVersion:    "0.1.0", // TODO: use actual version
+		AppVersion:    AppVersion,
 		SnapshotID:    id,
 		CreatedAt:     time.Now(),
 		EntryCount:    len(entries),
@@ -47,7 +51,12 @@ func CreateSnapshot(s *store.SQLiteStore, dataKey []byte, id uint64, path string
 	}
 	defer crypto.Zero(gzipped.Bytes())
 
-	// 5. Get Argon2 params for header
+	// 5. Get Argon2 params for header.
+	// Note: snapshots are encrypted with the dataKey active at the time of creation.
+	// After a password change, pre-existing snapshot files cannot be decrypted with
+	// the new key — each snapshot is self-contained and tied to the KDF params and
+	// salt embedded in its header. This is by design: snapshots are point-in-time
+	// backups and do not participate in re-encryption.
 	m, t, p, salt, err := s.GetArgon2Params()
 	if err != nil {
 		return fmt.Errorf("get argon2 params: %w", err)

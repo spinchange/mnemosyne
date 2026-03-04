@@ -74,7 +74,6 @@ func GetStyles(p Palette) Styles {
 
 		// Surface: HUD panel has its own card feel
 		HUD: lipgloss.NewStyle().
-			Width(36).
 			Background(p.Card).
 			Border(lipgloss.Border{Left: "▌"}, false, false, false, true).
 			BorderForeground(p.Subtle).
@@ -124,8 +123,7 @@ func GetStyles(p Palette) Styles {
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(p.Subtle).
 			Background(p.Card).
-			Padding(2, 4).
-			Width(44),
+			Padding(2, 4),
 
 		// Error messages
 		ErrorMsg: lipgloss.NewStyle().

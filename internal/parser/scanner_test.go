@@ -15,7 +15,10 @@ INVALID:lowercase
 NOT A TRIGGER
 STILL: good`
 
-	triggers := ScanContent(1, 1, content)
+	triggers, err := ScanContent(1, 1, content)
+	if err != nil {
+		t.Fatalf("ScanContent returned unexpected error: %v", err)
+	}
 
 	expected := []struct {
 		Prefix  string

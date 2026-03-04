@@ -14,21 +14,27 @@ import (
 	"golang.org/x/term"
 )
 
-func getPaths() (dbPath, appDir string) {
-	exePath, _ := os.Executable()
-	exeDir := filepath.Dir(exePath)
-	portableFile := filepath.Join(exeDir, ".portable")
-
-	if _, err := os.Stat(portableFile); err == nil {
-		// Portable mode: all data stays in the binary folder
-		return filepath.Join(exeDir, "mnemosyne.db"), exeDir
+func getPaths() (dbPath, appDir string, err error) {
+	exePath, exeErr := os.Executable()
+	if exeErr == nil {
+		exeDir := filepath.Dir(exePath)
+		portableFile := filepath.Join(exeDir, ".portable")
+		if _, statErr := os.Stat(portableFile); statErr == nil {
+			// Portable mode: all data stays in the binary folder
+			return filepath.Join(exeDir, "mnemosyne.db"), exeDir, nil
+		}
 	}
 
 	// Normal mode: use user home directory
-	home, _ := os.UserHomeDir()
+	home, homeErr := os.UserHomeDir()
+	if homeErr != nil {
+		return "", "", fmt.Errorf("cannot determine home directory: %w", homeErr)
+	}
 	appDir = filepath.Join(home, ".mnemosyne")
-	_ = os.MkdirAll(appDir, 0700)
-	return filepath.Join(appDir, "mnemosyne.db"), appDir
+	if mkErr := os.MkdirAll(appDir, 0700); mkErr != nil {
+		return "", "", fmt.Errorf("cannot create app directory: %w", mkErr)
+	}
+	return filepath.Join(appDir, "mnemosyne.db"), appDir, nil
 }
 
 func main() {
@@ -77,15 +83,19 @@ func handleRestore() {
 }
 
 func runTUI() {
-	// Setup logging
-	f, err := tea.LogToFile("debug.log", "mnemosyne")
+	dbPath, appDir, err := getPaths()
+	if err != nil {
+		fmt.Printf("Error determining data paths: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Setup logging inside the app data directory, not cwd
+	f, err := tea.LogToFile(filepath.Join(appDir, "debug.log"), "mnemosyne")
 	if err != nil {
 		fmt.Printf("Error setting up log file: %v\n", err)
 		os.Exit(1)
 	}
 	defer f.Close()
-
-	dbPath, appDir := getPaths()
 
 	s, err := store.NewSQLiteStore(dbPath)
 	if err != nil {

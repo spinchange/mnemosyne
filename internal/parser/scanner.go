@@ -36,10 +36,10 @@ func ScanLine(lineNo int, entryID int64, sessionID int64, line []byte) (*domain.
 	}, true
 }
 
-func ScanContent(entryID int64, sessionID int64, content string) []domain.Trigger {
+func ScanContent(entryID int64, sessionID int64, content string) ([]domain.Trigger, error) {
 	var triggers []domain.Trigger
 	scanner := bufio.NewScanner(strings.NewReader(content))
-	
+
 	// Increase buffer limit to 1MiB for exceptionally long lines
 	buf := make([]byte, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
@@ -51,8 +51,6 @@ func ScanContent(entryID int64, sessionID int64, content string) []domain.Trigge
 		}
 		lineNo++
 	}
-	
-	// Log or handle scanner.Err() if necessary, though for strings it's rare 
-	// unless a line exceeds the 1MiB buffer.
-	return triggers
+
+	return triggers, scanner.Err()
 }
