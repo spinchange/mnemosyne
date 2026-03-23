@@ -362,7 +362,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		if m.dataKey != nil && m.mode != ModeUnlock {
 			if time.Since(m.lastInput) >= time.Duration(m.config.AutoLockMinutes)*time.Minute {
-				return m.performLock()
+				newModel, lockCmd := m.performLock()
+				return newModel, tea.Batch(lockCmd, tick())
 			}
 		}
 
